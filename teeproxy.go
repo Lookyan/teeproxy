@@ -74,6 +74,62 @@ func handleRequest(request *http.Request, timeout time.Duration) (*http.Response
 	return response
 }
 
+// Sends a request and returns channel to wait for response.
+func handleAsyncRequest(request *http.Request, timeout time.Duration) (chan *http.Response) {
+	ch := make(chan *http.Response)
+	transport := &http.Transport{
+		// NOTE(girone): DialTLS is not needed here, because the teeproxy works
+		// as an SSL terminator.
+		Dial: (&net.Dialer{// go1.8 deprecated: Use DialContext instead
+			Timeout: timeout,
+			KeepAlive: 10 * timeout,
+		}).Dial,
+		// Close connections to the production and alternative servers?
+		DisableKeepAlives: *closeConnections,
+		//IdleConnTimeout: timeout,  // go1.8
+		TLSHandshakeTimeout:   timeout,
+		ResponseHeaderTimeout: timeout,
+		ExpectContinueTimeout: timeout,
+	}
+	go func() {
+		response, err := transport.RoundTrip(request)
+		if err != nil {
+			log.Println("Request failed:", err)
+		}
+		ch <- response
+	}()
+	return ch
+}
+
+// process response. Return true if resp is not nil
+func processResponse(resp *http.Response, w http.ResponseWriter) bool {
+	if resp != nil {
+		defer resp.Body.Close()
+
+		// Forward response headers.
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(resp.StatusCode)
+
+		// Forward response body.
+		body, _ := ioutil.ReadAll(resp.Body)
+		w.Write(body)
+		return true
+	}
+	return false
+}
+
+// compareResp compares responses assuming there is a json inside of body
+func compareResp(respProd *http.Response, respAlt *http.Response) {
+	if respProd.StatusCode == respAlt.StatusCode {
+		log.Println("Equal!")
+	} else {
+		log.Println("Not equal")
+	}
+}
+
+
 // handler contains the address of the main Target and the one for the Alternative target
 type handler struct {
 	Target      string
@@ -88,65 +144,57 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if *forwardClientIP {
 		updateForwardedHeaders(req)
 	}
-	if *percent == 100.0 || h.Randomizer.Float64()*100 < *percent {
-		alternativeRequest, productionRequest = DuplicateRequest(req)
-		go func() {
-			defer func() {
-				if r := recover(); r != nil && *debug {
-					log.Println("Recovered in ServeHTTP(alternate request) from:", r)
-				}
-			}()
 
-			setRequestTarget(alternativeRequest, altTarget)
-
-			if *alternateHostRewrite {
-				alternativeRequest.Host = h.Alternative
-			}
-
-			timeout := time.Duration(*alternateTimeout) * time.Millisecond
-			// This keeps responses from the alternative target away from the outside world.
-			alternateResponse := handleRequest(alternativeRequest, timeout)
-			if alternateResponse != nil {
-				// NOTE(girone): Even though we do not care about the second
-				// response, we still need to close the Body reader. Otherwise
-				// the connection stays open and we would soon run out of file
-				// descriptors.
-				alternateResponse.Body.Close()
-			}
-		}()
-	} else {
-		productionRequest = req
-	}
-	defer func() {
-		if r := recover(); r != nil && *debug {
-			log.Println("Recovered in ServeHTTP(production request) from:", r)
-		}
-	}()
-
+	// preparing prod request (we always need it)
+	alternativeRequest, productionRequest = DuplicateRequest(req)
 	setRequestTarget(productionRequest, targetProduction)
-
 	if *productionHostRewrite {
 		productionRequest.Host = h.Target
 	}
+	timeoutProd := time.Duration(*productionTimeout) * time.Millisecond
 
-	timeout := time.Duration(*productionTimeout) * time.Millisecond
-	resp := handleRequest(productionRequest, timeout)
-
-	if resp != nil {
-		defer resp.Body.Close()
-
-		// Forward response headers.
-		for k, v := range resp.Header {
-			w.Header()[k] = v
+	defer func() {
+		if r := recover(); r != nil && *debug {
+			log.Println("Recovered in ServeHTTP from:", r)
 		}
-		w.WriteHeader(resp.StatusCode)
+	}()
 
-		// Forward response body.
-		body, _ := ioutil.ReadAll(resp.Body)
-		w.Write(body)
+	if *percent == 100.0 || h.Randomizer.Float64()*100 < *percent {
+
+		setRequestTarget(alternativeRequest, altTarget)
+		if *alternateHostRewrite {
+			alternativeRequest.Host = h.Alternative
+		}
+		timeoutAlt := time.Duration(*alternateTimeout) * time.Millisecond
+
+		prodRespCh := handleAsyncRequest(productionRequest, timeoutProd)
+		altRespCh := handleAsyncRequest(alternativeRequest, timeoutAlt)
+
+		select {
+		case prodResp := <-prodRespCh:
+			processResponse(prodResp, w)
+			go func() {
+				altResp := <-altRespCh
+				compareResp(prodResp, altResp)
+			}()
+		case altResp := <-altRespCh:
+			prodResp := <-prodRespCh
+			processResponse(prodResp, w)
+			compareResp(prodResp, altResp)
+		}
+
+		return
+
+	} else {
+		productionRequest = req
 	}
-	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+
+	alternativeRequest = nil
+	respCh := handleAsyncRequest(productionRequest, timeoutProd)
+
+	resp := <- respCh
+
+	processResponse(resp, w)
 }
 
 func main() {
