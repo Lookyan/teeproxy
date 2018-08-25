@@ -278,7 +278,12 @@ func main() {
 		// Close connections to clients by setting the "Connection": "close" header in the response.
 		server.SetKeepAlivesEnabled(false)
 	}
-	server.Serve(listener)
+
+	go func() {
+		log.Fatal(server.Serve(listener))
+	}()
+
+	log.Fatal(http.ListenAndServe("localhost:6060", nil))
 }
 
 type nopCloser struct {
