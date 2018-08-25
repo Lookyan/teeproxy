@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/json"
 	"flag"
 	"io"
 	"io/ioutil"
@@ -10,6 +11,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"runtime"
 	"strings"
@@ -45,12 +47,12 @@ func setRequestTarget(request *http.Request, target *string) {
 }
 
 // Sends a request and returns the response.
-func handleRequest(request *http.Request, timeout time.Duration) (*http.Response) {
+func handleRequest(request *http.Request, timeout time.Duration) *http.Response {
 	transport := &http.Transport{
 		// NOTE(girone): DialTLS is not needed here, because the teeproxy works
 		// as an SSL terminator.
-		Dial: (&net.Dialer{// go1.8 deprecated: Use DialContext instead
-			Timeout: timeout,
+		Dial: (&net.Dialer{ // go1.8 deprecated: Use DialContext instead
+			Timeout:   timeout,
 			KeepAlive: 10 * timeout,
 		}).Dial,
 		// Close connections to the production and alternative servers?
@@ -75,13 +77,13 @@ func handleRequest(request *http.Request, timeout time.Duration) (*http.Response
 }
 
 // Sends a request and returns channel to wait for response.
-func handleAsyncRequest(request *http.Request, timeout time.Duration) (chan *http.Response) {
+func handleAsyncRequest(request *http.Request, timeout time.Duration) chan *http.Response {
 	ch := make(chan *http.Response)
 	transport := &http.Transport{
 		// NOTE(girone): DialTLS is not needed here, because the teeproxy works
 		// as an SSL terminator.
-		Dial: (&net.Dialer{// go1.8 deprecated: Use DialContext instead
-			Timeout: timeout,
+		Dial: (&net.Dialer{ // go1.8 deprecated: Use DialContext instead
+			Timeout:   timeout,
 			KeepAlive: 10 * timeout,
 		}).Dial,
 		// Close connections to the production and alternative servers?
@@ -102,7 +104,7 @@ func handleAsyncRequest(request *http.Request, timeout time.Duration) (chan *htt
 }
 
 // process response. Return true if resp is not nil
-func processResponse(resp *http.Response, w http.ResponseWriter) bool {
+func processResponse(resp *http.Response, w http.ResponseWriter) []byte {
 	if resp != nil {
 		defer resp.Body.Close()
 
@@ -115,20 +117,54 @@ func processResponse(resp *http.Response, w http.ResponseWriter) bool {
 		// Forward response body.
 		body, _ := ioutil.ReadAll(resp.Body)
 		w.Write(body)
-		return true
+		return body
 	}
-	return false
+	return nil
 }
 
 // compareResp compares responses assuming there is a json inside of body
-func compareResp(respProd *http.Response, respAlt *http.Response) {
-	if respProd.StatusCode == respAlt.StatusCode {
-		log.Println("Equal!")
+func compareResp(respProdBody []byte, respAlt *http.Response) {
+	if respAlt == nil {
+		// TODO: log alternative request error
 	} else {
-		log.Println("Not equal")
+		defer respAlt.Body.Close()
+
+		// don't compare headers
+
+		// Get entire response body.
+		respAltBody, _ := ioutil.ReadAll(respAlt.Body)
+		var respProdDeserealized interface{}
+		var respAltDeserealized interface{}
+		err := json.Unmarshal(respProdBody, respProdDeserealized)
+		if err != nil {
+			// then compare bytes
+			if bytes.Equal(respProdBody, respAltBody) {
+				log.Println("Equal")
+				return
+			} else {
+				log.Println("Not equal")
+				return
+			}
+		}
+		err = json.Unmarshal(respAltBody, respAltDeserealized)
+		if err != nil {
+			if bytes.Equal(respProdBody, respAltBody) {
+				log.Println("Equal")
+				return
+			} else {
+				log.Println("Not equal")
+				return
+			}
+		}
+
+		if respAltDeserealized != respProdDeserealized {
+			log.Println("Not equal")
+		} else {
+			log.Println("Equal")
+		}
+
 	}
 }
-
 
 // handler contains the address of the main Target and the one for the Alternative target
 type handler struct {
@@ -172,15 +208,17 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 		select {
 		case prodResp := <-prodRespCh:
-			processResponse(prodResp, w)
-			go func() {
-				altResp := <-altRespCh
-				compareResp(prodResp, altResp)
-			}()
+			respProdBody := processResponse(prodResp, w)
+			if respProdBody != nil {
+				go func() {
+					altResp := <-altRespCh
+					compareResp(respProdBody, altResp)
+				}()
+			}
 		case altResp := <-altRespCh:
 			prodResp := <-prodRespCh
-			processResponse(prodResp, w)
-			compareResp(prodResp, altResp)
+			respProdBody := processResponse(prodResp, w)
+			go compareResp(respProdBody, altResp)
 		}
 
 		return
@@ -192,7 +230,7 @@ func (h handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	alternativeRequest = nil
 	respCh := handleAsyncRequest(productionRequest, timeoutProd)
 
-	resp := <- respCh
+	resp := <-respCh
 
 	processResponse(resp, w)
 }
